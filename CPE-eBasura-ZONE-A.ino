@@ -1,4 +1,3 @@
-
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 #include <ESP32Servo.h>
@@ -7,82 +6,92 @@
 #include <ArduinoJson.h>
 
 // ── WiFi ─────────────────────────────────────
-const char* WIFI_SSID     = "Checo";
-const char* WIFI_PASSWORD = "12345678";
+const char* WIFI_SSID     = "KurtTyler";
+const char* WIFI_PASSWORD = "Pandemaca0";
 
-const char* SERVER_IP   = "10.37.96.167";
+const char* SERVER_IP   = "192.168.1.26";
 const int   SERVER_PORT = 80;
 
 // ── XSHUT Pins ───────────────────────────────
-#define XSHUT_S1   2
-#define XSHUT_S2   4
-#define XSHUT_S3   5
-#define XSHUT_S4  15
+#define XSHUT_S1  26
+#define XSHUT_S2  27
+#define XSHUT_S3  25
+#define XSHUT_S4  33
 
 // ── I2C Addresses ────────────────────────────
-#define ADDR_S1    0x30
-#define ADDR_S2    0x31
-#define ADDR_S3    0x32
-#define ADDR_S4    0x33
+#define ADDR_S1   0x30
+#define ADDR_S2   0x31
+#define ADDR_S3   0x32
+#define ADDR_S4   0x33
 
 // ── Servo Pins ───────────────────────────────
-#define SERVO_PIN_1  13
-#define SERVO_PIN_2  12
-#define SERVO_PIN_3  14
-#define SERVO_PIN_4  27
+#define SERVO_PIN_1  19
+#define SERVO_PIN_2  18
+#define SERVO_PIN_3   4
+#define SERVO_PIN_4   5
 
 // ── Servo Angles ─────────────────────────────
-#define SERVO_OPEN   160
-#define SERVO_CLOSE   55
+#define SERVO_OPEN    170
+#define SERVO_CLOSE    50
 
-// ── FULL condition ───────────────────────────
-#define FULL_DISTANCE_MM  20
+// ── Waste Level Thresholds ───────────────────
+#define DIST_FULL      50   // < 50mm  → 100% FULL → open servo
+#define DIST_HALF     100   // < 100mm → 50%
+#define DIST_LOW      170   // > 170mm → 10% (nearly empty)
 
-#define NUM_REAL_BINS      4
-#define POST_INTERVAL   2000
-#define ZONE_A_ID_OFFSET   0
+// ── Close delay ──────────────────────────────
+#define CLOSE_DELAY_MS  1500   // 1.5s before closing after bin clears
+
+// ── Config ───────────────────────────────────
+#define NUM_REAL_BINS     4
+#define POST_INTERVAL  2000
+#define ZONE_A_ID_OFFSET  0
 
 // ── Lookup tables ────────────────────────────
-const int     XSHUT_PINS[NUM_REAL_BINS]  = { XSHUT_S1,    XSHUT_S2,    XSHUT_S3,    XSHUT_S4    };
-const uint8_t ADDRESSES[NUM_REAL_BINS]   = { ADDR_S1,     ADDR_S2,     ADDR_S3,     ADDR_S4     };
-const int     SERVO_PINS[NUM_REAL_BINS]  = { SERVO_PIN_1, SERVO_PIN_2, SERVO_PIN_3, SERVO_PIN_4 };
+const int     XSHUT_PINS[NUM_REAL_BINS] = { XSHUT_S1,    XSHUT_S2,    XSHUT_S3,    XSHUT_S4    };
+const uint8_t ADDRESSES[NUM_REAL_BINS]  = { ADDR_S1,     ADDR_S2,     ADDR_S3,     ADDR_S4     };
+const int     SERVO_PINS[NUM_REAL_BINS] = { SERVO_PIN_1, SERVO_PIN_2, SERVO_PIN_3, SERVO_PIN_4 };
 
 // ── Sensors & Servos ─────────────────────────
 Adafruit_VL53L0X sensor[NUM_REAL_BINS];
-Servo           servo[NUM_REAL_BINS];
+Servo            servo[NUM_REAL_BINS];
 
-// ── Data ─────────────────────────────────────
-int  binDist[NUM_REAL_BINS] = {0};
-bool binOk[NUM_REAL_BINS]   = {false};
-bool lastState[NUM_REAL_BINS] = {false};
+// ── State ─────────────────────────────────────
+int           binDist[NUM_REAL_BINS]    = {0};
+int           binLevel[NUM_REAL_BINS]   = {0};
+bool          binOk[NUM_REAL_BINS]      = {false};
+bool          lastState[NUM_REAL_BINS]  = {false};  // true = open
+
+// ── Close timer per servo (non-blocking) ─────
+// 0 = no pending close
+unsigned long closeTimer[NUM_REAL_BINS] = {0};
 
 unsigned long lastPost = 0;
 
-// ── Function prototypes ───────────────────────
+// ── Prototypes ────────────────────────────────
 void initSensors();
 void readSensors();
 void updateServos();
 void postToServer();
+int  distToPercent(int distMm);
+const char* percentLabel(int pct);
 
-// ======================================================
+// =============================================
 void setup() {
-
   Serial.begin(115200);
   delay(500);
   Serial.println("[BOOT] Zone A Starting...");
 
-  // XSHUT — all LOW to reset
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     pinMode(XSHUT_PINS[i], OUTPUT);
     digitalWrite(XSHUT_PINS[i], LOW);
   }
   delay(200);
 
-  // I2C
   Wire.begin(21, 22);
   Wire.setClock(100000);
+  Serial.println("[I2C]  Wire started (SDA=21, SCL=22)");
 
-  // Attach servos and start CLOSED
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     servo[i].attach(SERVO_PINS[i]);
     servo[i].write(SERVO_CLOSE);
@@ -93,22 +102,20 @@ void setup() {
 
   initSensors();
 
-  // WiFi
-  Serial.printf("Connecting to %s", WIFI_SSID);
+  Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  Serial.printf("\n[WIFI] Zone A ONLINE  IP: %s\n",
+                WiFi.localIP().toString().c_str());
 
-  Serial.printf("\nZone A ONLINE IP: %s\n",
-    WiFi.localIP().toString().c_str());
+  Serial.println("=== Boot Complete ===\n");
 }
 
-// ======================================================
+// =============================================
 void loop() {
-
   readSensors();
   updateServos();
 
@@ -120,11 +127,26 @@ void loop() {
   delay(100);
 }
 
-// ======================================================
-// SENSOR INIT
-// ======================================================
-void initSensors() {
+// =============================================
+// DISTANCE → PERCENTAGE
+// =============================================
+int distToPercent(int distMm) {
+  if (distMm <= DIST_FULL) return 100;
+  if (distMm <= DIST_HALF) return 50;
+  if (distMm >  DIST_LOW)  return 10;
+  return map(distMm, DIST_HALF, DIST_LOW, 50, 10);
+}
 
+const char* percentLabel(int pct) {
+  if (pct == 100) return "FULL";
+  if (pct >= 50)  return "HALF";
+  return "LOW";
+}
+
+// =============================================
+// SENSOR INIT
+// =============================================
+void initSensors() {
   Serial.println("[INIT] VL53L0X Sensors A1–A4");
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
@@ -133,104 +155,151 @@ void initSensors() {
   delay(200);
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
-
     digitalWrite(XSHUT_PINS[i], HIGH);
     delay(200);
 
-    if (sensor[i].begin()) {
+    if (sensor[i].begin(0x29, false)) {
       sensor[i].setAddress(ADDRESSES[i]);
-      Serial.printf("[OK] A%d → I2C 0x%02X\n", i + 1, ADDRESSES[i]);
+      Serial.printf("[OK]  A%d → I2C 0x%02X  (XSHUT=GPIO%d)\n",
+                    i + 1, ADDRESSES[i], XSHUT_PINS[i]);
     } else {
-      Serial.printf("[ERR] A%d failed to init!\n", i + 1);
+      Serial.printf("[ERR] A%d failed! Check XSHUT=GPIO%d wiring.\n",
+                    i + 1, XSHUT_PINS[i]);
     }
   }
+  Serial.println("[INIT] Done\n");
 }
 
-// ======================================================
+// =============================================
 // READ ALL SENSORS
-// ======================================================
+// =============================================
 void readSensors() {
-
   VL53L0X_RangingMeasurementData_t m;
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
-
     sensor[i].rangingTest(&m, false);
 
     if (m.RangeStatus != 4) {
-      binDist[i] = m.RangeMilliMeter;
-      binOk[i]   = true;
+      binDist[i]  = m.RangeMilliMeter;
+      binLevel[i] = distToPercent(binDist[i]);
+      binOk[i]    = true;
     } else {
-      binDist[i] = 0;
-      binOk[i]   = false;
+      binDist[i]  = 0;
+      binLevel[i] = 0;
+      binOk[i]    = false;
     }
   }
 
-  Serial.printf("A1:%4dmm  A2:%4dmm  A3:%4dmm  A4:%4dmm\n",
-    binDist[0], binDist[1], binDist[2], binDist[3]);
+  Serial.println("┌────────┬──────────┬──────────┬──────────────┐");
+  Serial.println("│  Bin   │  Dist    │  Level   │  Servo       │");
+  Serial.println("├────────┼──────────┼──────────┼──────────────┤");
+  for (int i = 0; i < NUM_REAL_BINS; i++) {
+    if (binOk[i]) {
+      const char* servoStatus;
+      if (lastState[i])          servoStatus = "OPEN";
+      else if (closeTimer[i] > 0) servoStatus = "CLOSING...";
+      else                        servoStatus = "CLOSED";
+
+      Serial.printf("│  A%-2d   │  %4dmm  │  %3d%% %-4s│  %-12s│\n",
+                    i + 1, binDist[i], binLevel[i],
+                    percentLabel(binLevel[i]),
+                    servoStatus);
+    } else {
+      Serial.printf("│  A%-2d   │   ERR    │   ---    │   ---        │\n", i + 1);
+    }
+  }
+  Serial.println("└────────┴──────────┴──────────┴──────────────┘");
 }
 
-// ======================================================
-// SERVO LOGIC — only moves on state change
-// ======================================================
+// =============================================
+// SERVO LOGIC — non-blocking 1.5s close delay
+// =============================================
 void updateServos() {
+  unsigned long now = millis();
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
 
-    if (!binOk[i]) continue;
+    if (!binOk[i]) {
+      Serial.printf("[SKIP] A%d bad reading — servo unchanged\n", i + 1);
+      continue;
+    }
 
-    bool shouldOpen = (binDist[i] <= FULL_DISTANCE_MM);
+    bool shouldOpen = (binLevel[i] == 100);
 
-    if (shouldOpen != lastState[i]) {
-
-      if (shouldOpen) {
-        servo[i].write(SERVO_OPEN);
-        Serial.printf("[ALERT] A%d FULL → OPEN (%d°)\n", i + 1, SERVO_OPEN);
-      } else {
-        servo[i].write(SERVO_CLOSE);
-        Serial.printf("[OK] A%d NOT FULL → CLOSE (%d°)\n", i + 1, SERVO_CLOSE);
+    if (shouldOpen) {
+      // ── Bin is FULL → open immediately ────────
+      // Cancel any pending close timer first
+      if (closeTimer[i] > 0) {
+        closeTimer[i] = 0;
+        Serial.printf("[TIMER] A%d close timer cancelled — bin still FULL\n", i + 1);
       }
 
-      lastState[i] = shouldOpen;
+      if (!lastState[i]) {
+        servo[i].write(SERVO_OPEN);
+        lastState[i] = true;
+        Serial.printf("[OPEN]  A%d → %d%% FULL → OPEN (%d°)\n",
+                      i + 1, binLevel[i], SERVO_OPEN);
+      }
+
+    } else {
+      // ── Bin is NOT full ────────────────────────
+      if (lastState[i]) {
+        // Was open → start close timer if not already running
+        if (closeTimer[i] == 0) {
+          closeTimer[i] = now;
+          Serial.printf("[TIMER] A%d bin cleared → closing in %.1fs...\n",
+                        i + 1, CLOSE_DELAY_MS / 1000.0);
+        }
+      }
+
+      // ── Check if close timer has elapsed ──────
+      if (closeTimer[i] > 0 && (now - closeTimer[i] >= CLOSE_DELAY_MS)) {
+        servo[i].write(SERVO_CLOSE);
+        lastState[i]  = false;
+        closeTimer[i] = 0;
+        Serial.printf("[CLOSE] A%d → delay elapsed → CLOSE (%d°)\n",
+                      i + 1, SERVO_CLOSE);
+      }
     }
   }
 }
 
-// ======================================================
-// SERVER POST
-// ======================================================
+// =============================================
+// HTTP POST TO SERVER
+// =============================================
 void postToServer() {
-
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] WiFi disconnected — skipping POST");
+    return;
+  }
 
   JsonDocument doc;
   JsonArray arr = doc["bins"].to<JsonArray>();
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
-
     JsonObject b = arr.add<JsonObject>();
-    b["id"]   = i + ZONE_A_ID_OFFSET;
-    b["dist"] = binDist[i];
-    b["ok"]   = binOk[i];
-    b["open"] = lastState[i];
+    b["id"]    = i + ZONE_A_ID_OFFSET;
+    b["dist"]  = binDist[i];
+    b["level"] = binLevel[i];
+    b["ok"]    = binOk[i];
+    b["open"]  = lastState[i];
   }
 
   String payload;
   serializeJson(doc, payload);
 
   HTTPClient http;
-
-  String url =
-    String("http://") +
-    SERVER_IP + ":" +
-    SERVER_PORT +
-    "/api/zone/a";
+  String url = String("http://") + SERVER_IP + ":" + SERVER_PORT + "/api/zone/a";
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
 
   int code = http.POST(payload);
-  Serial.printf("[HTTP] POST → %d\n", code);
+  Serial.printf("[HTTP] POST %s → %d\n", url.c_str(), code);
+
+  if (code < 0) {
+    Serial.printf("[HTTP] Error: %s\n", HTTPClient::errorToString(code).c_str());
+  }
 
   http.end();
 }
