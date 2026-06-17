@@ -1,3 +1,5 @@
+// Zone A bins
+
 #include <Wire.h>
 #include <Adafruit_VL53L0X.h>
 #include <ESP32Servo.h>
@@ -13,8 +15,8 @@ const char* SERVER_IP   = "192.168.1.26";
 const int   SERVER_PORT = 80;
 
 // ── XSHUT Pins ───────────────────────────────
-#define XSHUT_S1  26
-#define XSHUT_S2  27
+#define XSHUT_S1  26 
+#define XSHUT_S2  27 
 #define XSHUT_S3  25
 #define XSHUT_S4  33
 
@@ -31,8 +33,8 @@ const int   SERVER_PORT = 80;
 #define SERVO_PIN_4   5
 
 // ── Servo Angles ─────────────────────────────
-#define SERVO_OPEN    170
-#define SERVO_CLOSE    50
+#define SERVO_CLOSE  60
+#define SERVO_OPEN   170
 
 // ── Waste Level Thresholds ───────────────────
 #define DIST_FULL      50   // < 50mm  → 100% FULL → open servo
@@ -94,9 +96,9 @@ void setup() {
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     servo[i].attach(SERVO_PINS[i]);
-    servo[i].write(SERVO_CLOSE);
-    Serial.printf("[SERVO] A%d attached pin %d → CLOSE (%d°)\n",
-                  i + 1, SERVO_PINS[i], SERVO_CLOSE);
+    servo[i].write(SERVO_OPEN);
+    Serial.printf("[SERVO] A%d attached pin %d → OPEN (%d°)\n",
+                  i + 1, SERVO_PINS[i], SERVO_OPEN);
   }
   delay(500);
 
@@ -196,9 +198,9 @@ void readSensors() {
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     if (binOk[i]) {
       const char* servoStatus;
-      if (lastState[i])          servoStatus = "OPEN";
-      else if (closeTimer[i] > 0) servoStatus = "CLOSING...";
-      else                        servoStatus = "CLOSED";
+      if (lastState[i])          servoStatus = "CLOSED";
+      else if (closeTimer[i] > 0) servoStatus = "OPENING...";
+      else                        servoStatus = "OPEN";
 
       Serial.printf("│  A%-2d   │  %4dmm  │  %3d%% %-4s│  %-12s│\n",
                     i + 1, binDist[i], binLevel[i],
@@ -224,9 +226,9 @@ void updateServos() {
       continue;
     }
 
-    bool shouldOpen = (binLevel[i] == 100);
+    bool shouldClose = (binLevel[i] == 100);
 
-    if (shouldOpen) {
+    if (shouldClose) {
       // ── Bin is FULL → open immediately ────────
       // Cancel any pending close timer first
       if (closeTimer[i] > 0) {
@@ -235,10 +237,10 @@ void updateServos() {
       }
 
       if (!lastState[i]) {
-        servo[i].write(SERVO_OPEN);
+        servo[i].write(SERVO_CLOSE);
         lastState[i] = true;
-        Serial.printf("[OPEN]  A%d → %d%% FULL → OPEN (%d°)\n",
-                      i + 1, binLevel[i], SERVO_OPEN);
+        Serial.printf("[CLOSE]  A%d → %d%% FULL → OPEN (%d°)\n",
+                      i + 1, binLevel[i], SERVO_CLOSE);
       }
 
     } else {
@@ -254,11 +256,11 @@ void updateServos() {
 
       // ── Check if close timer has elapsed ──────
       if (closeTimer[i] > 0 && (now - closeTimer[i] >= CLOSE_DELAY_MS)) {
-        servo[i].write(SERVO_CLOSE);
+        servo[i].write(SERVO_OPEN);
         lastState[i]  = false;
         closeTimer[i] = 0;
-        Serial.printf("[CLOSE] A%d → delay elapsed → CLOSE (%d°)\n",
-                      i + 1, SERVO_CLOSE);
+        Serial.printf("[OPEN] A%d → delay elapsed → CLOSE (%d°)\n",
+                      i + 1, SERVO_OPEN);
       }
     }
   }
