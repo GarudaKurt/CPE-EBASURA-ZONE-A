@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>
 
 // ── WiFi ─────────────────────────────────────
 const char* WIFI_SSID     = "KurtTyler";
@@ -15,8 +16,8 @@ const char* SERVER_IP   = "192.168.1.26";
 const int   SERVER_PORT = 80;
 
 // ── XSHUT Pins ───────────────────────────────
-#define XSHUT_S1  26 
-#define XSHUT_S2  27 
+#define XSHUT_S1  26
+#define XSHUT_S2  27
 #define XSHUT_S3  25
 #define XSHUT_S4  33
 
@@ -33,16 +34,16 @@ const int   SERVER_PORT = 80;
 #define SERVO_PIN_4   5
 
 // ── Servo Angles ─────────────────────────────
-#define SERVO_CLOSE  60
+#define SERVO_CLOSE   60
 #define SERVO_OPEN   170
 
 // ── Waste Level Thresholds ───────────────────
-#define DIST_FULL      50   // < 50mm  → 100% FULL → open servo
+#define DIST_FULL      50   // < 50mm  → 100% FULL → close servo
 #define DIST_HALF     100   // < 100mm → 50%
 #define DIST_LOW      170   // > 170mm → 10% (nearly empty)
 
 // ── Close delay ──────────────────────────────
-#define CLOSE_DELAY_MS  1500   // 1.5s before closing after bin clears
+#define CLOSE_DELAY_MS  1500   // 1.5s before re-opening after bin clears
 
 // ── Config ───────────────────────────────────
 #define NUM_REAL_BINS     4
@@ -54,18 +55,19 @@ const int     XSHUT_PINS[NUM_REAL_BINS] = { XSHUT_S1,    XSHUT_S2,    XSHUT_S3, 
 const uint8_t ADDRESSES[NUM_REAL_BINS]  = { ADDR_S1,     ADDR_S2,     ADDR_S3,     ADDR_S4     };
 const int     SERVO_PINS[NUM_REAL_BINS] = { SERVO_PIN_1, SERVO_PIN_2, SERVO_PIN_3, SERVO_PIN_4 };
 
-// ── Sensors & Servos ─────────────────────────
+// ── Sensors, Servos & Web server ─────────────
 Adafruit_VL53L0X sensor[NUM_REAL_BINS];
 Servo            servo[NUM_REAL_BINS];
+AsyncWebServer   localServer(80);
 
 // ── State ─────────────────────────────────────
 int           binDist[NUM_REAL_BINS]    = {0};
 int           binLevel[NUM_REAL_BINS]   = {0};
 bool          binOk[NUM_REAL_BINS]      = {false};
-bool          lastState[NUM_REAL_BINS]  = {false};  // true = open
+bool          lastState[NUM_REAL_BINS]  = {false};  // true = CLOSED, false = OPEN
 
-// ── Close timer per servo (non-blocking) ─────
-// 0 = no pending close
+// ── Re-open timer per servo (non-blocking) ───
+// 0 = no pending re-open
 unsigned long closeTimer[NUM_REAL_BINS] = {0};
 
 unsigned long lastPost = 0;
@@ -112,6 +114,32 @@ void setup() {
   }
   Serial.printf("\n[WIFI] Zone A ONLINE  IP: %s\n",
                 WiFi.localIP().toString().c_str());
+
+  // ── POST /api/pick — force open a specific servo ──
+  // Called by the server ESP32, forwarding a pick request from the dashboard.
+  // Body param: bin=<globalId>  (0–3 for Zone A)
+  localServer.on("/api/pick", HTTP_POST, [](AsyncWebServerRequest* req) {
+    int binId = -1;
+
+    if (req->hasParam("bin", true)) {
+      binId = req->getParam("bin", true)->value().toInt();
+    }
+
+    // Zone A owns global ids 0–3; local servo index = binId
+    if (binId >= 0 && binId <= 3) {
+      servo[binId].write(SERVO_OPEN);
+      lastState[binId]  = false;   // false = OPEN
+      closeTimer[binId] = 0;       // cancel any pending re-open timer
+      Serial.printf("[PICK] A%d → forced OPEN via /api/pick\n", binId + 1);
+      req->send(200, "application/json", "{\"status\":\"ok\"}");
+    } else {
+      Serial.printf("[PICK] ERR — invalid bin id: %d\n", binId);
+      req->send(400, "application/json", "{\"error\":\"invalid bin id for Zone A\"}");
+    }
+  });
+
+  localServer.begin();
+  Serial.println("[HTTP] Zone A local server started on port 80");
 
   Serial.println("=== Boot Complete ===\n");
 }
@@ -198,7 +226,7 @@ void readSensors() {
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     if (binOk[i]) {
       const char* servoStatus;
-      if (lastState[i])          servoStatus = "CLOSED";
+      if (lastState[i])           servoStatus = "CLOSED";
       else if (closeTimer[i] > 0) servoStatus = "OPENING...";
       else                        servoStatus = "OPEN";
 
@@ -214,7 +242,8 @@ void readSensors() {
 }
 
 // =============================================
-// SERVO LOGIC — non-blocking 1.5s close delay
+// SERVO LOGIC — non-blocking 1.5s re-open delay
+// lastState: true = CLOSED (bin full), false = OPEN (default)
 // =============================================
 void updateServos() {
   unsigned long now = millis();
@@ -229,37 +258,35 @@ void updateServos() {
     bool shouldClose = (binLevel[i] == 100);
 
     if (shouldClose) {
-      // ── Bin is FULL → open immediately ────────
-      // Cancel any pending close timer first
+      // ── Bin is FULL → close immediately ───────
       if (closeTimer[i] > 0) {
         closeTimer[i] = 0;
-        Serial.printf("[TIMER] A%d close timer cancelled — bin still FULL\n", i + 1);
+        Serial.printf("[TIMER] A%d re-open timer cancelled — bin still FULL\n", i + 1);
       }
 
       if (!lastState[i]) {
         servo[i].write(SERVO_CLOSE);
-        lastState[i] = true;
-        Serial.printf("[CLOSE]  A%d → %d%% FULL → OPEN (%d°)\n",
+        lastState[i] = true;   // true = CLOSED
+        Serial.printf("[CLOSE] A%d → %d%% FULL → CLOSE (%d°)\n",
                       i + 1, binLevel[i], SERVO_CLOSE);
       }
 
     } else {
-      // ── Bin is NOT full ────────────────────────
+      // ── Bin is NOT full → re-open after delay ─
       if (lastState[i]) {
-        // Was open → start close timer if not already running
         if (closeTimer[i] == 0) {
           closeTimer[i] = now;
-          Serial.printf("[TIMER] A%d bin cleared → closing in %.1fs...\n",
+          Serial.printf("[TIMER] A%d bin cleared → re-opening in %.1fs...\n",
                         i + 1, CLOSE_DELAY_MS / 1000.0);
         }
       }
 
-      // ── Check if close timer has elapsed ──────
+      // ── Check if re-open timer has elapsed ────
       if (closeTimer[i] > 0 && (now - closeTimer[i] >= CLOSE_DELAY_MS)) {
         servo[i].write(SERVO_OPEN);
-        lastState[i]  = false;
+        lastState[i]  = false;   // false = OPEN
         closeTimer[i] = 0;
-        Serial.printf("[OPEN] A%d → delay elapsed → CLOSE (%d°)\n",
+        Serial.printf("[OPEN]  A%d → delay elapsed → OPEN (%d°)\n",
                       i + 1, SERVO_OPEN);
       }
     }
