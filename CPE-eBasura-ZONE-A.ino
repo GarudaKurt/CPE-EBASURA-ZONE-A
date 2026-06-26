@@ -9,10 +9,10 @@
 #include <ESPAsyncWebServer.h>
 
 // ── WiFi ─────────────────────────────────────
-const char* WIFI_SSID     = "KurtTyler";
-const char* WIFI_PASSWORD = "Pandemaca0";
+const char* WIFI_SSID     = "Checo";
+const char* WIFI_PASSWORD = "12345678";
 
-const char* SERVER_IP   = "192.168.1.26";
+const char* SERVER_IP   = "10.98.96.66";
 const int   SERVER_PORT = 80;
 
 // ── XSHUT Pins ───────────────────────────────
@@ -45,6 +45,9 @@ const int   SERVER_PORT = 80;
 // ── Close delay ──────────────────────────────
 #define CLOSE_DELAY_MS  1500   // 1.5s before re-opening after bin clears
 
+// ── Forced-open duration (pick command) ──────
+#define FORCED_OPEN_DURATION_MS  5000  // 5s hold-open after a pick
+
 // ── Config ───────────────────────────────────
 #define NUM_REAL_BINS     4
 #define POST_INTERVAL  2000
@@ -69,6 +72,11 @@ bool          lastState[NUM_REAL_BINS]  = {false};  // true = CLOSED, false = OP
 // ── Re-open timer per servo (non-blocking) ───
 // 0 = no pending re-open
 unsigned long closeTimer[NUM_REAL_BINS] = {0};
+
+// ── Forced-open state (pick command) ─────────
+// Prevents updateServos() from re-closing immediately after a pick
+bool          forcedOpen[NUM_REAL_BINS]      = {false};
+unsigned long forcedOpenTimer[NUM_REAL_BINS] = {0};
 
 unsigned long lastPost = 0;
 
@@ -128,9 +136,12 @@ void setup() {
     // Zone A owns global ids 0–3; local servo index = binId
     if (binId >= 0 && binId <= 3) {
       servo[binId].write(SERVO_OPEN);
-      lastState[binId]  = false;   // false = OPEN
-      closeTimer[binId] = 0;       // cancel any pending re-open timer
-      Serial.printf("[PICK] A%d → forced OPEN via /api/pick\n", binId + 1);
+      lastState[binId]       = false;        // false = OPEN
+      closeTimer[binId]      = 0;            // cancel any pending re-open timer
+      forcedOpen[binId]      = true;         // block updateServos() from re-closing
+      forcedOpenTimer[binId] = millis();     // start the hold-open countdown
+      Serial.printf("[PICK] A%d → forced OPEN via /api/pick (held for %ds)\n",
+                    binId + 1, FORCED_OPEN_DURATION_MS / 1000);
       req->send(200, "application/json", "{\"status\":\"ok\"}");
     } else {
       Serial.printf("[PICK] ERR — invalid bin id: %d\n", binId);
@@ -226,7 +237,8 @@ void readSensors() {
   for (int i = 0; i < NUM_REAL_BINS; i++) {
     if (binOk[i]) {
       const char* servoStatus;
-      if (lastState[i])           servoStatus = "CLOSED";
+      if (forcedOpen[i])          servoStatus = "FORCED OPEN";
+      else if (lastState[i])      servoStatus = "CLOSED";
       else if (closeTimer[i] > 0) servoStatus = "OPENING...";
       else                        servoStatus = "OPEN";
 
@@ -249,6 +261,17 @@ void updateServos() {
   unsigned long now = millis();
 
   for (int i = 0; i < NUM_REAL_BINS; i++) {
+
+    // ── Forced-open guard — skip normal logic while active ──
+    if (forcedOpen[i]) {
+      if (now - forcedOpenTimer[i] >= FORCED_OPEN_DURATION_MS) {
+        forcedOpen[i] = false;
+        Serial.printf("[PICK] A%d forced-open expired → resuming normal logic\n", i + 1);
+        // Fall through to normal logic immediately
+      } else {
+        continue;  // Hold open; don't let sensor re-close this bin
+      }
+    }
 
     if (!binOk[i]) {
       Serial.printf("[SKIP] A%d bad reading — servo unchanged\n", i + 1);
